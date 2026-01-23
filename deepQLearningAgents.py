@@ -16,13 +16,12 @@ class PacmanDeepQAgent(PacmanQAgent):
         self.update_amount = 0
         self.epsilon_explore = 1.0
         self.epsilon0 = 0.05
-        self.epsilon = self.epsilon0
-        self.discount = 0.9
-        self.update_frequency = 3
-        self.counts = None
+        self.epsilon = self.epsilon_explore
+        self.discount = 0.95 # 稍微调低折扣率，关注短期食物
+        self.update_frequency = 1
         self.replay_memory = ReplayMemory(50000)
-        self.min_transitions_before_training = 10000
-        self.td_error_clipping = 1
+        self.min_transitions_before_training = 1000
+        self.td_error_clipping = 1.0
 
         # Initialize Q networks:
         if isinstance(layout_input, str):
@@ -33,50 +32,51 @@ class PacmanDeepQAgent(PacmanQAgent):
         self.initialize_q_networks(self.state_dim)
 
         self.doubleQ = doubleQ
-        if self.doubleQ:
-            self.target_update_rate = -1
+        if self.target_update_rate == -1:
+            self.target_update_rate = 500
+        
+        # 修复同步问题，确保代理知晓训练局数
+        self.numTraining = self.model.numTrainingGames
+        
+        self.all_actions = ['North', 'South', 'East', 'West', 'Stop']
 
     def get_state_dim(self, layout):
-        pac_ft_size = 2
-        ghost_ft_size = 2 * layout.getNumGhosts()
-        food_capsule_ft_size = layout.width * layout.height
-        return pac_ft_size + ghost_ft_size + food_capsule_ft_size
+        return 3 * layout.width * layout.height
 
     def get_features(self, state):
-        pacman_state = np.array(state.getPacmanPosition())
-        ghost_state = np.array(state.getGhostPositions())
-        capsules = state.getCapsules()
-        food_locations = np.array(state.getFood().data).astype(np.float32)
-        for x, y in capsules:
-            food_locations[x][y] = 2
-        return np.concatenate((pacman_state, ghost_state.flatten(), food_locations.flatten()))
+        food_grid = state.getFood()
+        width, height = food_grid.width, food_grid.height
+        pac_grid = np.zeros((width, height))        gradient * (inputs[0] - inputs[1]) / inputs[0].size
+        px, py = state.getPacmanPosition()
+        pac_grid[px][py] = 1.0
+        ghost_grid = np.zeros((width, height))
+        for gx, gy in state.getGhostPositions():
+            ghost_grid[int(gx)][int(gy)] = 1.0
+        f_data = np.array(food_grid.data).astype(float)
+        return np.concatenate([pac_grid.flatten(), ghost_grid.flatten(), f_data.flatten()])
 
     def initialize_q_networks(self, state_dim, action_dim=5):
         import model
         self.model = model.DeepQNetwork(state_dim, action_dim)
         self.target_model = model.DeepQNetwork(state_dim, action_dim)
+        self.target_model.set_weights(self.model.parameters)
 
     def getQValue(self, state, action):
         """
           Should return Q(state,action) as predicted by self.model
         """
         feats = self.get_features(state)
-        legalActions = self.getLegalActions(state)
-        action_index = legalActions.index(action)
-        state = nn.Constant(np.array([feats]).astype("float64"))
-        return self.model.run(state).data[0][action_index]
+        action_index = self.all_actions.index(action)
+        state_node = nn.Constant(np.array([feats]).astype("float64"))
+        return self.model.run(state_node).data[0][action_index]
 
 
     def shape_reward(self, reward):
-        if reward > 100:
-            reward = 10
-        elif reward > 0 and reward < 10:
-            reward = 2
-        elif reward == -1:
-            reward = 0
-        elif reward < -100:
-            reward = -10
-        return reward
+        # 稳定的奖励塑造
+        if reward > 100: return 10.0   # Win
+        if reward < -100: return -10.0 # Loss
+        if reward > 5: return 2.0      # Food
+        return -0.1                    # Move
 
 
     def compute_q_targets(self, minibatch, network = None, target_network=None, doubleQ=False):
@@ -100,13 +100,15 @@ class PacmanDeepQAgent(PacmanQAgent):
 
         Q_predict = network.run(states).data
         Q_target = np.copy(Q_predict)
-        state_indices = states.data.astype(int)
-        state_indices = (state_indices[:, 0], state_indices[:, 1])
-        exploration_bonus = 1 / (2 * np.sqrt((self.counts[state_indices] / 100)))
 
         replace_indices = np.arange(actions.shape[0])
-        action_indices = np.argmax(network.run(next_states).data, axis=1)
-        target = rewards + exploration_bonus + (1 - done) * self.discount * target_network.run(next_states).data[replace_indices, action_indices]
+        
+        if doubleQ:
+            action_indices = np.argmax(network.run(next_states).data, axis=1)
+        else:
+            action_indices = np.argmax(target_network.run(next_states).data, axis=1)
+
+        target = rewards + (1 - done) * self.discount * target_network.run(next_states).data[replace_indices, action_indices]
 
         Q_target[replace_indices, actions] = target
 
@@ -117,26 +119,21 @@ class PacmanDeepQAgent(PacmanQAgent):
         return Q_target
 
     def update(self, state, action, nextState, reward):
-        legalActions = self.getLegalActions(state)
-        action_index = legalActions.index(action)
+        action_index = self.all_actions.index(action)
         done = nextState.isLose() or nextState.isWin()
         reward = self.shape_reward(reward)
 
-        if self.counts is None:
-            x, y = np.array(state.getFood().data).shape
-            self.counts = np.ones((x, y))
+        state_feats = self.get_features(state)
+        next_state_feats = self.get_features(nextState)
 
-        state = self.get_features(state)
-        nextState = self.get_features(nextState)
-        self.counts[int(state[0])][int(state[1])] += 1
+        self.replay_memory.push(state_feats, action_index, reward, next_state_feats, done)
 
-        transition = (state, action_index, reward, nextState, done)
-        self.replay_memory.push(*transition)
-
+        # 衰减周期 - 调大以确保足够的训练时间
+        decay_steps = 50000
         if len(self.replay_memory) < self.min_transitions_before_training:
             self.epsilon = self.epsilon_explore
         else:
-            self.epsilon = max(self.epsilon0 * (1 - self.update_amount / 20000), 0)
+            self.epsilon = max(self.epsilon0, self.epsilon_explore - (self.epsilon_explore - self.epsilon0) * (self.update_amount - self.min_transitions_before_training) / decay_steps)
 
         if len(self.replay_memory) > self.min_transitions_before_training and self.update_amount % self.update_frequency == 0:
             minibatch = self.replay_memory.pop(self.model.batch_size)
@@ -145,16 +142,10 @@ class PacmanDeepQAgent(PacmanQAgent):
             Q_target1 = self.compute_q_targets(minibatch, self.model, self.target_model, doubleQ=self.doubleQ)
             Q_target1 = nn.Constant(Q_target1.astype("float64"))
 
-            if self.doubleQ:
-                Q_target2 = self.compute_q_targets(minibatch, self.target_model, self.model, doubleQ=self.doubleQ)
-                Q_target2 = nn.Constant(Q_target2.astype("float64"))
-            
             self.model.gradient_update(states, Q_target1)
-            if self.doubleQ:
-                self.target_model.gradient_update(states, Q_target2)
 
         if self.target_update_rate > 0 and self.update_amount % self.target_update_rate == 0:
-            self.target_model.set_weights(copy.deepcopy(self.model.parameters))
+            self.target_model.set_weights(self.model.parameters)
 
         self.update_amount += 1
 
